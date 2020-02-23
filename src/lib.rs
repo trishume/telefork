@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::io::Write;
+use std::io::{Read, Write};
 
 use libc;
 use nix;
@@ -30,6 +30,7 @@ struct Mapping {
 #[derive(Serialize, Deserialize)]
 enum Command {
     Mapping(Mapping),
+    Registers { len: usize },
 }
 
 fn should_skip_map(map: &proc_maps::MapRange) -> bool {
@@ -92,6 +93,30 @@ fn write_map(out: &mut dyn Write, child: Pid, map: &proc_maps::MapRange) -> Resu
     Ok(())
 }
 
+#[repr(C)]
+struct RegInfo {
+    regs: libc::user_regs_struct,
+}
+
+impl RegInfo {
+    fn to_bytes(&self) -> &[u8] {
+        let pointer = self as *const Self as *const u8;
+        unsafe {
+            std::slice::from_raw_parts(pointer, std::mem::size_of::<Self>())
+        }
+    }
+
+    // fn from_bytes(bytes: &[u8]) -> Option<&Self> {
+    //     if bytes.len() < std::mem::size_of::<Self>() {
+    //         return None;
+    //     }
+    //     if bytes.as_ptr().align_offset(std::mem::align_of::<Self>()) != 0 {
+    //         return None;
+    //     }
+    //     Some(unsafe { std::mem::transmute::<*const u8, &Self>(bytes.as_ptr()) })
+    // }
+}
+
 fn write_state(out: &mut dyn Write, child: Pid) -> Result<()> {
     let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
     // print_maps_info(&maps);
@@ -99,6 +124,13 @@ fn write_state(out: &mut dyn Write, child: Pid) -> Result<()> {
     for map in &maps {
         write_map(out, child, map)?;
     }
+
+    // === Write registers
+    let regs = RegInfo { regs: ptrace::getregs(child)? };
+    let reg_bytes = regs.to_bytes();
+    bincode::serialize_into::<&mut dyn Write, Command>(out, &Command::Registers { len: reg_bytes.len() })?;
+    out.write(reg_bytes)?;
+
     Ok(())
 }
 
@@ -133,7 +165,7 @@ pub enum TeleforkLocation {
     Child,
 }
 
-fn print_maps_info(maps: &[proc_maps::MapRange]) {
+fn _print_maps_info(maps: &[proc_maps::MapRange]) {
     for map in maps {
         println!("{:>7} {:?}", map.size(), map.filename());
         // println!("{:?}", map);
@@ -152,4 +184,13 @@ pub fn telefork(out: &mut dyn Write) -> Result<TeleforkLocation> {
 
     kill(child, Signal::SIGKILL)?;
     Ok(TeleforkLocation::Parent)
+}
+
+pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
+    println!("incoming on telepad");
+    let child: Pid = match fork_frozen_traced()? {
+        NormalForkLocation::Woke => panic!("should wake up as a different process!"),
+        NormalForkLocation::Parent(p) => p,
+    };
+    Ok(child)
 }
