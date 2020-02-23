@@ -10,7 +10,7 @@ use nix::errno::Errno;
 use nix::sys::ptrace;
 use nix::sys::signal::{kill, raise, Signal};
 use nix::sys::uio;
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{waitpid, WaitStatus, WaitPidFlag};
 use nix::unistd::{fork, ForkResult, Pid};
 
 use proc_maps;
@@ -21,14 +21,30 @@ use serde::{Deserialize, Serialize};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const PAGE_SIZE: usize = 4096;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Mapping {
     name: Option<String>,
     readable: bool,
     writeable: bool,
     executable: bool,
-    offset: usize,
+    addr: usize,
     size: usize,
+}
+
+impl Mapping {
+    fn prot(&self) -> i32 {
+        let mut prot = 0;
+        if self.readable {
+            prot |= PROT_READ;
+        }
+        if self.writeable {
+            prot |= PROT_WRITE;
+        }
+        if self.executable {
+            prot |= PROT_EXEC;
+        }
+        prot
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -67,7 +83,7 @@ fn write_map(out: &mut dyn Write, child: Pid, map: &proc_maps::MapRange) -> Resu
         readable: map.is_read(),
         writeable: map.is_write(),
         executable: map.is_exec(),
-        offset: map.start(),
+        addr: map.start(),
         size: map.size(),
     };
     bincode::serialize_into::<&mut dyn Write, Command>(out, &Command::Mapping(mapping))?;
@@ -103,7 +119,7 @@ fn write_map(out: &mut dyn Write, child: Pid, map: &proc_maps::MapRange) -> Resu
 
 #[repr(C)]
 struct RegInfo {
-    regs: libc::user_regs_struct,
+    pub regs: libc::user_regs_struct,
 }
 
 impl RegInfo {
@@ -112,15 +128,15 @@ impl RegInfo {
         unsafe { std::slice::from_raw_parts(pointer, std::mem::size_of::<Self>()) }
     }
 
-    // fn from_bytes(bytes: &[u8]) -> Option<&Self> {
-    //     if bytes.len() < std::mem::size_of::<Self>() {
-    //         return None;
-    //     }
-    //     if bytes.as_ptr().align_offset(std::mem::align_of::<Self>()) != 0 {
-    //         return None;
-    //     }
-    //     Some(unsafe { std::mem::transmute::<*const u8, &Self>(bytes.as_ptr()) })
-    // }
+    fn from_bytes(bytes: &[u8]) -> Option<&Self> {
+        if bytes.len() < std::mem::size_of::<Self>() {
+            return None;
+        }
+        if bytes.as_ptr().align_offset(std::mem::align_of::<Self>()) != 0 {
+            return None;
+        }
+        Some(unsafe { std::mem::transmute::<*const u8, &Self>(bytes.as_ptr()) })
+    }
 }
 
 fn write_state(out: &mut dyn Write, child: Pid) -> Result<()> {
@@ -164,6 +180,7 @@ fn fork_frozen_traced() -> Result<NormalForkLocation> {
             _ => error("couldn't trace child"),
         },
         ForkResult::Child => {
+            println!("hello from forked child!");
             kill_me_if_parent_dies()?;
             ptrace::traceme()?;
             raise(Signal::SIGSTOP)?;
@@ -252,6 +269,9 @@ fn remote_mmap_anon(
     if mmap_location == -1 {
         error("mmap syscall exited with -1")?;
     }
+    if addr != 0 && mmap_location as usize != addr {
+        error("failed to mmap at correct location")?;
+    }
     Ok(mmap_location as usize)
 }
 
@@ -272,6 +292,32 @@ fn remote_munmap(child: Pid, syscall: SyscallLoc, addr: usize, length: usize) ->
         // println!("rax = {:x}; rip = {:x}", new_regs.rax, new_regs.rip);
         error("failed to munmap")?;
     }
+    Ok(())
+}
+
+fn stream_memory(child: Pid, inp: &mut dyn Read, addr: usize, length: usize) -> Result<()> {
+    let mut remaining_size = length;
+    let mut buf = vec![0u8; PAGE_SIZE];
+    while remaining_size > 0 {
+        let batch_size = std::cmp::min(buf.len(), remaining_size);
+        let offset = addr + (length - remaining_size);
+
+        inp.read_exact(&mut buf[..batch_size])?;
+
+        let wrote = uio::process_vm_writev(
+            child,
+            &[uio::IoVec::from_slice(&buf[..batch_size])],
+            &[uio::RemoteIoVec {
+                base: offset,
+                len: batch_size,
+            }],
+        )?;
+        if wrote == 0 {
+            return error("failed to write to process");
+        }
+        remaining_size -= batch_size;
+    }
+
     Ok(())
 }
 
@@ -298,12 +344,13 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     let temp_syscall = SyscallLoc(regs.rip as u64);
 
     // ==== remote mmap syscall to map a page there
+    let prot_all = PROT_READ | PROT_WRITE | PROT_EXEC;
     let mmap_location = remote_mmap_anon(
         child,
         temp_syscall,
         None,
         PAGE_SIZE,
-        PROT_READ | PROT_WRITE | PROT_EXEC,
+        prot_all,
     )?;
 
     // ==== jump to new region
@@ -330,31 +377,52 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
         remote_munmap(child, syscall, map.start(), map.size())?;
     }
 
-    println!("========== new maps:");
-    let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
-    _print_maps_info(&maps[..]);
+    // println!("========== after delete:");
+    // let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
+    // _print_maps_info(&maps[..]);
 
-    // loop {
-    //     match bincode::deserialize_from::<&mut dyn Read, Command>(inp)? {
-    //         Command::Mapping(mapping) => {
-    //             // TODO read
-    //             // TODO remote mmap new areas
-    //             // TODO set new area filenames
-    //             // TODO writev new areas
-    //         }
-    //         Command::ResumeWithRegisters { len } => {
-    //             // TODO read
-    //             // TODO set registers
-    //             // TODO resume
-    //             break;
-    //         }
-    //     }
-    // }
+    loop {
+        match bincode::deserialize_from::<&mut dyn Read, Command>(inp)? {
+            Command::Mapping(m) => {
+                if mmap_location >= m.addr && mmap_location < m.addr + m.size {
+                    // TODO dodge or avoid this ahead of time
+                    error("mapping to recreate collides with syscall page")?;
+                }
+                // println!("recreating {:?}", m);
+                let addr = remote_mmap_anon(child, syscall, Some(m.addr), m.size, prot_all)?;
+                // println!("recreated at {:?}", addr);
+                // TODO set new area filenames
+                stream_memory(child, inp, addr, m.size)?;
+                // TODO remote mprotect to restore previous permissions
+            }
+            Command::ResumeWithRegisters { len } => {
+                let mut reg_bytes = vec![0u8; len];
+                inp.read_exact(&mut reg_bytes[..])?;
+                // FIXME remove unwrap
+                let reg_info = RegInfo::from_bytes(&reg_bytes[..]).unwrap();
+                ptrace::setregs(child, reg_info.regs)?;
+                // TODO resume
+                break;
+            }
+        }
+    }
+
+    // println!("========== recreated maps:");
+    // let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
+    // _print_maps_info(&maps[..]);
 
     // TODO remote mremap vdso stuff
     // TODO restore registers
     // TODO maybe jump to right place or maybe I can just restore rip
     // TODO resume
+    ptrace::cont(child, None)?;
 
     Ok(child)
+}
+
+pub fn wait_for_exit(child: Pid) -> Result<i32> {
+    match waitpid(child, None)? {
+        WaitStatus::Exited(_, code) => Ok(code),
+        _ => error("somehow got other wait status instead of exit"),
+    }
 }
