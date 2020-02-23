@@ -1,8 +1,10 @@
 use std::error::Error;
-use std::io::{Read, Write};
 use std::ffi::c_void;
+use std::io::{Read, Write};
 
 use libc;
+use libc::{PROT_EXEC, PROT_READ, PROT_WRITE};
+
 use nix;
 use nix::errno::Errno;
 use nix::sys::ptrace;
@@ -32,7 +34,7 @@ struct Mapping {
 #[derive(Serialize, Deserialize)]
 enum Command {
     Mapping(Mapping),
-    Registers { len: usize },
+    ResumeWithRegisters { len: usize },
 }
 
 fn is_special_kernel_map(map: &proc_maps::MapRange) -> bool {
@@ -107,9 +109,7 @@ struct RegInfo {
 impl RegInfo {
     fn to_bytes(&self) -> &[u8] {
         let pointer = self as *const Self as *const u8;
-        unsafe {
-            std::slice::from_raw_parts(pointer, std::mem::size_of::<Self>())
-        }
+        unsafe { std::slice::from_raw_parts(pointer, std::mem::size_of::<Self>()) }
     }
 
     // fn from_bytes(bytes: &[u8]) -> Option<&Self> {
@@ -132,9 +132,16 @@ fn write_state(out: &mut dyn Write, child: Pid) -> Result<()> {
     }
 
     // === Write registers
-    let regs = RegInfo { regs: ptrace::getregs(child)? };
+    let regs = RegInfo {
+        regs: ptrace::getregs(child)?,
+    };
     let reg_bytes = regs.to_bytes();
-    bincode::serialize_into::<&mut dyn Write, Command>(out, &Command::Registers { len: reg_bytes.len() })?;
+    bincode::serialize_into::<&mut dyn Write, Command>(
+        out,
+        &Command::ResumeWithRegisters {
+            len: reg_bytes.len(),
+        },
+    )?;
     out.write(reg_bytes)?;
 
     Ok(())
@@ -173,7 +180,13 @@ pub enum TeleforkLocation {
 
 fn _print_maps_info(maps: &[proc_maps::MapRange]) {
     for map in maps {
-        println!("{:>7} {:>16x} {} {:?}", map.size(), map.start(), map.flags, map.filename());
+        println!(
+            "{:>7} {:>16x} {} {:?}",
+            map.size(),
+            map.start(),
+            map.flags,
+            map.filename()
+        );
         // println!("{:?}", map);
     }
     let total_size: usize = maps.iter().map(|m| m.size()).sum();
@@ -200,6 +213,68 @@ fn single_step(child: Pid) -> Result<()> {
     }
 }
 
+#[derive(Copy, Clone)]
+struct SyscallLoc(u64);
+
+fn remote_mmap_anon(
+    child: Pid,
+    syscall: SyscallLoc,
+    addr: Option<usize>,
+    length: usize,
+    prot: i32,
+) -> Result<usize> {
+    if length % PAGE_SIZE != 0 {
+        error("mmap length must be multiple of page size")?;
+    }
+    let SyscallLoc(loc) = syscall;
+    let regs = ptrace::getregs(child)?;
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+    let (addr, flags) = match addr {
+        Some(addr) => (addr, flags | libc::MAP_FIXED),
+        None => (0, flags),
+    };
+    let mmap_regs = libc::user_regs_struct {
+        rip: loc,
+        rax: 9,             // mmap
+        rdi: addr as u64,   // addr
+        rsi: length as u64, // length
+        rdx: prot as u64,   // prot
+        r10: flags as u64,  // flags
+        r8: (-1i64) as u64, // fd
+        r9: 0,              // offset
+        ..regs
+    };
+    ptrace::setregs(child, mmap_regs)?;
+    single_step(child)?;
+    let regs = ptrace::getregs(child)?;
+    let mmap_location: i64 = regs.rax as i64;
+    // println!("mmap location = {:x}; pre sys = {:x}; pre = {:x}", mmap_location, mmap_regs.rax as i64, regs.rax as i64);
+    if mmap_location == -1 {
+        error("mmap syscall exited with -1")?;
+    }
+    Ok(mmap_location as usize)
+}
+
+fn remote_munmap(child: Pid, syscall: SyscallLoc, addr: usize, length: usize) -> Result<()> {
+    let SyscallLoc(loc) = syscall;
+    let regs = ptrace::getregs(child)?;
+    let syscall_regs = libc::user_regs_struct {
+        rip: loc as u64,    // syscall instr
+        rax: 11,            // munmap
+        rdi: addr as u64,   // addr
+        rsi: length as u64, // length
+        ..regs
+    };
+    ptrace::setregs(child, syscall_regs)?;
+    single_step(child)?;
+    let new_regs = ptrace::getregs(child)?;
+    if new_regs.rax != 0 {
+        // println!("rax = {:x}; rip = {:x}", new_regs.rax, new_regs.rip);
+        error("failed to munmap")?;
+    }
+    Ok(())
+}
+
 pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     println!("incoming on telepad");
     let child: Pid = match fork_frozen_traced()? {
@@ -217,29 +292,19 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     let old_word: i64 = ptrace::read(child, regs.rip as *mut c_void)?;
     // println!("old word = {:x}", old_word);
     // SYSCALL; JMP %rax
-    let syscall_word: i64 = i64::from_ne_bytes([0x0f,0x05,0xff,0xe0,0,0,0,0]);
+    let syscall_word: i64 = i64::from_ne_bytes([0x0f, 0x05, 0xff, 0xe0, 0, 0, 0, 0]);
     // println!("new word = {:x}", syscall_word);
     ptrace::write(child, regs.rip as *mut c_void, syscall_word as *mut c_void)?;
+    let temp_syscall = SyscallLoc(regs.rip as u64);
 
     // ==== remote mmap syscall to map a page there
-    let mmap_regs = libc::user_regs_struct {
-        rax: 9, // mmap
-        rdi: 0, // addr
-        rsi: PAGE_SIZE as u64, // length
-        rdx: (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64, // prot
-        r10: (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64, // flags
-        r8: (-1i64) as u64, // fd
-        r9: 0, // offset
-        ..regs
-    };
-    ptrace::setregs(child, mmap_regs)?;
-    single_step(child)?;
-    let regs = ptrace::getregs(child)?;
-    let mmap_location: i64 = regs.rax as i64;
-    println!("mmap location = {:x}; pre sys = {:x}; pre = {:x}", mmap_location, mmap_regs.rax as i64, regs.rax as i64);
-    if mmap_location == -1 {
-        error("failed to mmap")?;
-    }
+    let mmap_location = remote_mmap_anon(
+        child,
+        temp_syscall,
+        None,
+        PAGE_SIZE,
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+    )?;
 
     // ==== jump to new region
     // single_step(child)?;
@@ -249,37 +314,44 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     // }
 
     // ==== poke syscall into new page
-    ptrace::write(child, mmap_location as *mut c_void, syscall_word as *mut c_void)?;
+    ptrace::write(
+        child,
+        mmap_location as *mut c_void,
+        syscall_word as *mut c_void,
+    )?;
+    let syscall = SyscallLoc(mmap_location as u64);
 
-    // TODO remote munmap all original regions except vdso stuff
+    // ==== remote munmap all original regions except vdso stuff
     for map in &orig_maps {
         if is_special_kernel_map(map) || map.size() == 0 {
             continue;
         }
         // println!("unmapping {:?}", map);
-        let syscall_regs = libc::user_regs_struct {
-            rip: mmap_location as u64, // syscall instr
-            rax: 11, // munmap
-            rdi: map.start() as u64, // addr
-            rsi: map.size() as u64, // length
-            ..regs
-        };
-        ptrace::setregs(child, syscall_regs)?;
-        single_step(child)?;
-        let new_regs = ptrace::getregs(child)?;
-        if new_regs.rax != 0 {
-            println!("rax = {:x}; rip = {:x}", new_regs.rax, new_regs.rip);
-            error("failed to munmap")?;
-        }
+        remote_munmap(child, syscall, map.start(), map.size())?;
     }
 
     println!("========== new maps:");
     let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
     _print_maps_info(&maps[..]);
-    // TODO remote mremap vdso stuff
 
-    // TODO remote mmap new areas
-    // TODO writev new areas
+    // loop {
+    //     match bincode::deserialize_from::<&mut dyn Read, Command>(inp)? {
+    //         Command::Mapping(mapping) => {
+    //             // TODO read
+    //             // TODO remote mmap new areas
+    //             // TODO set new area filenames
+    //             // TODO writev new areas
+    //         }
+    //         Command::ResumeWithRegisters { len } => {
+    //             // TODO read
+    //             // TODO set registers
+    //             // TODO resume
+    //             break;
+    //         }
+    //     }
+    // }
+
+    // TODO remote mremap vdso stuff
     // TODO restore registers
     // TODO maybe jump to right place or maybe I can just restore rip
     // TODO resume
