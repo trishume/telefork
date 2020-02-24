@@ -50,7 +50,14 @@ impl Mapping {
 #[derive(Serialize, Deserialize)]
 enum Command {
     Mapping(Mapping),
-    ResumeWithRegisters { len: usize },
+    Remap {
+        name: String,
+        addr: usize,
+        size: usize,
+    },
+    ResumeWithRegisters {
+        len: usize,
+    },
 }
 
 fn is_special_kernel_map(map: &proc_maps::MapRange) -> bool {
@@ -66,7 +73,7 @@ fn should_skip_map(map: &proc_maps::MapRange) -> bool {
     if !map.is_read() || map.size() == 0 {
         return true;
     }
-    is_special_kernel_map(map)
+    false
 }
 
 fn error<T>(s: &'static str) -> Result<T> {
@@ -78,6 +85,20 @@ fn write_map(out: &mut dyn Write, child: Pid, map: &proc_maps::MapRange) -> Resu
         // eprintln!("Skipping {:?}", map);
         return Ok(());
     }
+    // for special kernel mappings we remap the mappings from the donor
+    if is_special_kernel_map(map) {
+        let comm = Command::Remap {
+            name: map
+                .filename()
+                .clone()
+                .expect("can't be a kernel map without a name"),
+            addr: map.start(),
+            size: map.size(),
+        };
+        bincode::serialize_into::<&mut dyn Write, Command>(out, &comm)?;
+        return Ok(());
+    }
+
     let mapping = Mapping {
         name: map.filename().clone(),
         readable: map.is_read(),
@@ -295,6 +316,42 @@ fn remote_munmap(child: Pid, syscall: SyscallLoc, addr: usize, length: usize) ->
     Ok(())
 }
 
+fn remote_mremap(
+    child: Pid,
+    syscall: SyscallLoc,
+    addr: usize,
+    length: usize,
+    new_addr: usize,
+) -> Result<()> {
+    if addr == new_addr {
+        return Ok(());
+    }
+
+    let SyscallLoc(loc) = syscall;
+    let regs = ptrace::getregs(child)?;
+    let syscall_regs = libc::user_regs_struct {
+        rip: loc as u64,                                         // syscall instr
+        rax: 25,                                                 // mremap
+        rdi: addr as u64,                                        // addr
+        rsi: length as u64,                                      // old_length
+        rdx: length as u64,                                      // new_length
+        r10: (libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED) as u64, // flags
+        r8: new_addr as u64,                                     // new_addr
+        ..regs
+    };
+    ptrace::setregs(child, syscall_regs)?;
+    single_step(child)?;
+    let new_regs = ptrace::getregs(child)?;
+    if new_regs.rax as i64 == -1 {
+        error("failed to mremap")?;
+    }
+    if new_regs.rax as usize != new_addr {
+        // println!("remapped to {:x} from {:x} instead of {:x}", new_regs.rax, addr, new_addr);
+        error("didn't mremap to correct location")?;
+    }
+    Ok(())
+}
+
 fn stream_memory(child: Pid, inp: &mut dyn Read, addr: usize, length: usize) -> Result<()> {
     let mut remaining_size = length;
     let mut buf = vec![0u8; PAGE_SIZE];
@@ -338,8 +395,18 @@ fn try_to_find_syscall(child: Pid, addr: usize) -> Result<usize> {
     let syscall = &[0x0f, 0x05];
     match buf.windows(syscall.len()).position(|w| w == syscall) {
         Some(index) => Ok(index),
-        None => error("couldn't find syscall")
+        None => error("couldn't find syscall"),
     }
+}
+
+fn find_map_named<'a>(
+    maps: &'a [proc_maps::MapRange],
+    name: &str,
+) -> Option<&'a proc_maps::MapRange> {
+    maps.iter().find(|map| match map.filename() {
+        Some(n) if n == name => true,
+        _ => false,
+    })
 }
 
 pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
@@ -352,16 +419,9 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     let orig_maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
     // _print_maps_info(&orig_maps[..]);
 
-    // FIXME find an address that is safe from both processes
-
-    let vdso_map = orig_maps.iter().find(|map| {
-        match map.filename() {
-            Some(n) if n == "[vdso]" => true,
-            _ => false
-        }
-    }).unwrap();
+    let vdso_map = find_map_named(&orig_maps, "[vdso]").unwrap();
     let vdso_syscall_offset = try_to_find_syscall(child, vdso_map.start())?;
-    let vdso_syscall = SyscallLoc((vdso_map.start() + vdso_syscall_offset) as u64);
+    let mut vdso_syscall = SyscallLoc((vdso_map.start() + vdso_syscall_offset) as u64);
 
     // ==== remote munmap all original regions except vdso stuff
     for map in &orig_maps {
@@ -373,12 +433,31 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     }
 
     // println!("========== after delete:");
-    // let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
+    let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
     // _print_maps_info(&maps[..]);
 
     let prot_all = PROT_READ | PROT_WRITE | PROT_EXEC;
     loop {
         match bincode::deserialize_from::<&mut dyn Read, Command>(inp)? {
+            Command::Remap { name, addr, size } => {
+                let matching_map = find_map_named(&maps, &name).unwrap();
+                if size != matching_map.size() {
+                    error("size mismatch in remap")?;
+                }
+                // println!("remapping {:?}", matching_map);
+                remote_mremap(
+                    child,
+                    vdso_syscall,
+                    matching_map.start(),
+                    matching_map.size(),
+                    addr,
+                )?;
+
+                if &name == "[vdso]" {
+                    vdso_syscall = SyscallLoc((addr + vdso_syscall_offset) as u64);
+                    // println!("changing vdso syscall to {:x}", vdso_syscall.0);
+                }
+            }
             Command::Mapping(m) => {
                 // println!("recreating {:?}", m);
                 let addr = remote_mmap_anon(child, vdso_syscall, Some(m.addr), m.size, prot_all)?;
@@ -402,7 +481,6 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     // let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
     // _print_maps_info(&maps[..]);
 
-    // TODO remote mremap vdso stuff
     ptrace::cont(child, None)?;
 
     Ok(child)
