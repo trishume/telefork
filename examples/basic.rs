@@ -4,7 +4,7 @@ use std::fs::File;
 
 fn main() {
     println!("Hello!");
-    let foo = 973;
+    let foo = 103;
     let fname = "dump.telefork.bin";
     let loc = {
         let mut output = File::create(fname).unwrap();

@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::ffi::c_void;
+// use std::ffi::c_void;
 use std::io::{Read, Write};
 
 use libc;
@@ -321,6 +321,27 @@ fn stream_memory(child: Pid, inp: &mut dyn Read, addr: usize, length: usize) -> 
     Ok(())
 }
 
+fn try_to_find_syscall(child: Pid, addr: usize) -> Result<usize> {
+    let mut buf = vec![0u8; PAGE_SIZE];
+    let wrote = uio::process_vm_readv(
+        child,
+        &[uio::IoVec::from_mut_slice(&mut buf[..])],
+        &[uio::RemoteIoVec {
+            base: addr,
+            len: PAGE_SIZE,
+        }],
+    )?;
+    if wrote == 0 {
+        return error("failed to read from other process");
+    }
+
+    let syscall = &[0x0f, 0x05];
+    match buf.windows(syscall.len()).position(|w| w == syscall) {
+        Some(index) => Ok(index),
+        None => error("couldn't find syscall")
+    }
+}
+
 pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     println!("incoming on telepad");
     let child: Pid = match fork_frozen_traced()? {
@@ -333,40 +354,14 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
 
     // FIXME find an address that is safe from both processes
 
-    // ==== poke syscall into current rip
-    let regs = ptrace::getregs(child)?;
-    // let old_word: i64 = ptrace::read(child, regs.rip as *mut c_void)?;
-    // println!("old word = {:x}", old_word);
-    // SYSCALL; JMP %rax
-    let syscall_word: i64 = i64::from_ne_bytes([0x0f, 0x05, 0xff, 0xe0, 0, 0, 0, 0]);
-    // println!("new word = {:x}", syscall_word);
-    ptrace::write(child, regs.rip as *mut c_void, syscall_word as *mut c_void)?;
-    let temp_syscall = SyscallLoc(regs.rip as u64);
-
-    // ==== remote mmap syscall to map a page there
-    let prot_all = PROT_READ | PROT_WRITE | PROT_EXEC;
-    let mmap_location = remote_mmap_anon(
-        child,
-        temp_syscall,
-        None,
-        PAGE_SIZE,
-        prot_all,
-    )?;
-
-    // ==== jump to new region
-    // single_step(child)?;
-    // let regs = ptrace::getregs(child)?;
-    // if regs.rip as i64 != mmap_location {
-    //     error("jump unsuccessful")?;
-    // }
-
-    // ==== poke syscall into new page
-    ptrace::write(
-        child,
-        mmap_location as *mut c_void,
-        syscall_word as *mut c_void,
-    )?;
-    let syscall = SyscallLoc(mmap_location as u64);
+    let vdso_map = orig_maps.iter().find(|map| {
+        match map.filename() {
+            Some(n) if n == "[vdso]" => true,
+            _ => false
+        }
+    }).unwrap();
+    let vdso_syscall_offset = try_to_find_syscall(child, vdso_map.start())?;
+    let vdso_syscall = SyscallLoc((vdso_map.start() + vdso_syscall_offset) as u64);
 
     // ==== remote munmap all original regions except vdso stuff
     for map in &orig_maps {
@@ -374,22 +369,19 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
             continue;
         }
         // println!("unmapping {:?}", map);
-        remote_munmap(child, syscall, map.start(), map.size())?;
+        remote_munmap(child, vdso_syscall, map.start(), map.size())?;
     }
 
     // println!("========== after delete:");
     // let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
     // _print_maps_info(&maps[..]);
 
+    let prot_all = PROT_READ | PROT_WRITE | PROT_EXEC;
     loop {
         match bincode::deserialize_from::<&mut dyn Read, Command>(inp)? {
             Command::Mapping(m) => {
-                if mmap_location >= m.addr && mmap_location < m.addr + m.size {
-                    // TODO dodge or avoid this ahead of time
-                    error("mapping to recreate collides with syscall page")?;
-                }
                 // println!("recreating {:?}", m);
-                let addr = remote_mmap_anon(child, syscall, Some(m.addr), m.size, prot_all)?;
+                let addr = remote_mmap_anon(child, vdso_syscall, Some(m.addr), m.size, prot_all)?;
                 // println!("recreated at {:?}", addr);
                 // TODO set new area filenames
                 stream_memory(child, inp, addr, m.size)?;
@@ -401,7 +393,6 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
                 // FIXME remove unwrap
                 let reg_info = RegInfo::from_bytes(&reg_bytes[..]).unwrap();
                 ptrace::setregs(child, reg_info.regs)?;
-                // TODO resume
                 break;
             }
         }
@@ -412,9 +403,6 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     // _print_maps_info(&maps[..]);
 
     // TODO remote mremap vdso stuff
-    // TODO restore registers
-    // TODO maybe jump to right place or maybe I can just restore rip
-    // TODO resume
     ptrace::cont(child, None)?;
 
     Ok(child)
