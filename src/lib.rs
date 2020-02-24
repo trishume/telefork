@@ -10,7 +10,7 @@ use nix::errno::Errno;
 use nix::sys::ptrace;
 use nix::sys::signal::{kill, raise, Signal};
 use nix::sys::uio;
-use nix::sys::wait::{waitpid, WaitStatus, WaitPidFlag};
+use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
 
 use proc_maps;
@@ -32,7 +32,7 @@ struct Mapping {
 }
 
 impl Mapping {
-    fn prot(&self) -> i32 {
+    fn _prot(&self) -> i32 {
         let mut prot = 0;
         if self.readable {
             prot |= PROT_READ;
@@ -335,7 +335,7 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
 
     // ==== poke syscall into current rip
     let regs = ptrace::getregs(child)?;
-    let old_word: i64 = ptrace::read(child, regs.rip as *mut c_void)?;
+    // let old_word: i64 = ptrace::read(child, regs.rip as *mut c_void)?;
     // println!("old word = {:x}", old_word);
     // SYSCALL; JMP %rax
     let syscall_word: i64 = i64::from_ne_bytes([0x0f, 0x05, 0xff, 0xe0, 0, 0, 0, 0]);

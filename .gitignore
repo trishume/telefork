@@ -2,3 +2,6 @@
 **/*.rs.bk
 Cargo.lock
 *.bin
+*.sublime-*
+docker-extras-bin
+rust-analyzer.sh
