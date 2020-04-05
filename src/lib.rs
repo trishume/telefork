@@ -80,25 +80,20 @@ fn error<T>(s: &'static str) -> Result<T> {
     Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, s)))
 }
 
-fn write_map(out: &mut dyn Write, child: Pid, map: &proc_maps::MapRange) -> Result<()> {
-    if should_skip_map(map) {
-        // eprintln!("Skipping {:?}", map);
-        return Ok(());
-    }
-    // for special kernel mappings we remap the mappings from the donor
-    if is_special_kernel_map(map) {
-        let comm = Command::Remap {
-            name: map
-                .filename()
-                .clone()
-                .expect("can't be a kernel map without a name"),
-            addr: map.start(),
-            size: map.size(),
-        };
-        bincode::serialize_into::<&mut dyn Write, Command>(out, &comm)?;
-        return Ok(());
-    }
+fn write_special_kernel_map(out: &mut dyn Write, map: &proc_maps::MapRange) -> Result<()> {
+    let comm = Command::Remap {
+        name: map
+            .filename()
+            .clone()
+            .expect("can't be a kernel map without a name"),
+        addr: map.start(),
+        size: map.size(),
+    };
+    bincode::serialize_into::<&mut dyn Write, Command>(out, &comm)?;
+    return Ok(());
+}
 
+fn write_regular_map(out: &mut dyn Write, child: Pid, map: &proc_maps::MapRange) -> Result<()> {
     let mapping = Mapping {
         name: map.filename().clone(),
         readable: map.is_read(),
@@ -164,8 +159,19 @@ fn write_state(out: &mut dyn Write, child: Pid) -> Result<()> {
     let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
     // print_maps_info(&maps);
 
-    for map in &maps {
-        write_map(out, child, map)?;
+    // we write out special kernel maps like the vdso first so that we can remap them
+    // to their correct position before some other regular map perhaps stomps on their
+    // original position.
+    let (special_maps, regular_maps) = maps
+        .into_iter()
+        .filter(|m| !should_skip_map(&m))
+        .partition::<Vec<proc_maps::MapRange>, _>(|m| is_special_kernel_map(&m));
+
+    for map in &special_maps {
+        write_special_kernel_map(out, map)?;
+    }
+    for map in &regular_maps {
+        write_regular_map(out, child, map)?;
     }
 
     // === Write registers
@@ -412,7 +418,7 @@ fn find_map_named<'a>(
 pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     println!("incoming on telepad");
     let child: Pid = match fork_frozen_traced()? {
-        NormalForkLocation::Woke => panic!("should wake up as a different process!"),
+        NormalForkLocation::Woke => panic!("should've woken up with my brain replaced but didn't!"),
         NormalForkLocation::Parent(p) => p,
     };
 
@@ -476,6 +482,9 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
             }
         }
     }
+
+    // TODO restore brk
+    // TODO restore TLS
 
     // println!("========== recreated maps:");
     // let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
