@@ -48,7 +48,13 @@ impl Mapping {
 }
 
 #[derive(Serialize, Deserialize)]
+struct ProcessState {
+    brk_addr: usize,
+}
+
+#[derive(Serialize, Deserialize)]
 enum Command {
+    ProcessState(ProcessState),
     Mapping(Mapping),
     Remap {
         name: String,
@@ -155,7 +161,9 @@ impl RegInfo {
     }
 }
 
-fn write_state(out: &mut dyn Write, child: Pid) -> Result<()> {
+fn write_state(out: &mut dyn Write, child: Pid, proc_state: ProcessState) -> Result<()> {
+    bincode::serialize_into::<&mut dyn Write, Command>(out, &Command::ProcessState(proc_state))?;
+
     let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
     // print_maps_info(&maps);
 
@@ -239,11 +247,16 @@ fn _print_maps_info(maps: &[proc_maps::MapRange]) {
 
 pub fn telefork(out: &mut dyn Write) -> Result<TeleforkLocation> {
     println!("teleforking");
+    let proc_state = ProcessState {
+        // sbrk(0) returns current brk address and it won't change for child since we don't malloc before forking
+        brk_addr: unsafe { libc::sbrk(0) as usize },
+    };
+    // println!("brk addr: {:>16x}", proc_state.brk_addr);
     let child: Pid = match fork_frozen_traced()? {
         NormalForkLocation::Woke => return Ok(TeleforkLocation::Child),
         NormalForkLocation::Parent(p) => p,
     };
-    write_state(out, child)?;
+    write_state(out, child, proc_state)?;
 
     kill(child, Signal::SIGKILL)?;
     Ok(TeleforkLocation::Parent)
@@ -320,6 +333,21 @@ fn remote_munmap(child: Pid, syscall: SyscallLoc, addr: usize, length: usize) ->
         error("failed to munmap")?;
     }
     Ok(())
+}
+
+fn remote_brk(child: Pid, syscall: SyscallLoc, brk: usize) -> Result<usize> {
+    let SyscallLoc(loc) = syscall;
+    let regs = ptrace::getregs(child)?;
+    let syscall_regs = libc::user_regs_struct {
+        rip: loc as u64, // syscall instr
+        rax: 12,         // munmap
+        rdi: brk as u64, // addr
+        ..regs
+    };
+    ptrace::setregs(child, syscall_regs)?;
+    single_step(child)?;
+    let new_regs = ptrace::getregs(child)?;
+    Ok(new_regs.rax as usize)
 }
 
 fn remote_mremap(
@@ -415,6 +443,28 @@ fn find_map_named<'a>(
     })
 }
 
+fn restore_brk(child: Pid, syscall: SyscallLoc, brk_addr: usize) -> Result<()> {
+    // TODO according to DMTCP this is the procedure that should work, but in
+    // my testing it doesn't if the target brk is below the original heap,
+    // then brk just doesn't update the heap. The way to fix this that also
+    // restores a bunch of other things is to use PR_SET_MM_MAP but that's not
+    // always available, requires high permissions, and it's hard to source
+    // all the fields for that. In the case that it fails this implementation
+    // is basically the same as not restoring the brk at all.
+
+    let orig_brk = remote_brk(child, syscall, 0)?;
+    // Is it possible that changing the brk could munmap the vdso? I think not with default layouts but maybe wrong.
+    let new_brk = remote_brk(child, syscall, brk_addr)?;
+
+    // println!("brk orig={:>16x} new={:>16x} target={:>16x}", orig_brk, new_brk, brk_addr);
+    if new_brk > orig_brk {
+        // we mapped a new region but we want everything cleared away still so munmap it
+        remote_munmap(child, syscall, orig_brk, new_brk - orig_brk)?;
+    }
+
+    Ok(())
+}
+
 pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     println!("incoming on telepad");
     let child: Pid = match fork_frozen_traced()? {
@@ -438,13 +488,16 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
         remote_munmap(child, vdso_syscall, map.start(), map.size())?;
     }
 
-    // println!("========== after delete:");
     let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
+    // println!("========== after delete:");
     // _print_maps_info(&maps[..]);
 
     let prot_all = PROT_READ | PROT_WRITE | PROT_EXEC;
     loop {
         match bincode::deserialize_from::<&mut dyn Read, Command>(inp)? {
+            Command::ProcessState(ProcessState { brk_addr }) => {
+                restore_brk(child, vdso_syscall, brk_addr)?;
+            }
             Command::Remap { name, addr, size } => {
                 let matching_map = find_map_named(&maps, &name).unwrap();
                 if size != matching_map.size() {
@@ -483,8 +536,12 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
         }
     }
 
-    // TODO restore brk
-    // TODO restore TLS
+    // TODO maybe use /proc/sys/kernel/ns_last_pid to restore with the same PID if possible? http://efiop-notes.blogspot.com/2014/06/how-to-set-pid-using-nslastpid.html
+    // TODO restore TLS: This seems to involve using the arch_prcntl syscall to save and restore the FS and GS registers
+    // ptrace does save/restore fs and gs though and TLS variables appear to work to me so maybe that isn't necessary?
+    // There's also something about how glibc caches the pid and tid which are wrong in the new process.
+
+    // TODO restore or forward some types of file descriptors? Maybe basic files that also exist on the new system?
 
     // println!("========== recreated maps:");
     // let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
