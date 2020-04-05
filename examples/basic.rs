@@ -3,6 +3,7 @@ use telefork::{telefork, telepad, wait_for_exit, TeleforkLocation};
 use std::fs::File;
 
 use std::sync::atomic::{AtomicU32, Ordering};
+// use nix::sys::signal::{raise, Signal};
 
 thread_local! {
     static TEST_TLS : AtomicU32 = AtomicU32::new(7);
@@ -24,6 +25,8 @@ fn main() {
     };
     match loc {
         TeleforkLocation::Child => {
+            // raise(Signal::SIGSTOP).unwrap();
+            // std::process::exit(foo);
             println!("hello from a strange new world where foo={}", foo);
 
             // I'm somewhat confused about why TLS seems to me to just work.
@@ -32,6 +35,7 @@ fn main() {
             // set what Linux thinks they should be so they don't get
             // overwritten with the wrong things when a thread swaps back in.
             print_tls_val();
+
             std::thread::sleep(std::time::Duration::from_millis(100));
             print_tls_val();
             std::process::exit(foo)

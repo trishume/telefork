@@ -165,7 +165,7 @@ fn write_state(out: &mut dyn Write, child: Pid, proc_state: ProcessState) -> Res
     bincode::serialize_into::<&mut dyn Write, Command>(out, &Command::ProcessState(proc_state))?;
 
     let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
-    // print_maps_info(&maps);
+    // _print_maps_info(&maps);
 
     // we write out special kernel maps like the vdso first so that we can remap them
     // to their correct position before some other regular map perhaps stomps on their
@@ -500,9 +500,15 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
             }
             Command::Remap { name, addr, size } => {
                 let matching_map = find_map_named(&maps, &name).unwrap();
+
+                // TODO on my NixOS box the VDSO is a different size than my Docker container
+                // this may just be a case that's nigh-impossible to handle fully correctly or I'm missing a trick
+
                 if size != matching_map.size() {
-                    error("size mismatch in remap")?;
+                    // error("size mismatch in remap")?;
+                    eprintln!("size mismatch in remap for {}", name);
                 }
+
                 // println!("remapping {:?}", matching_map);
                 remote_mremap(
                     child,
@@ -547,7 +553,7 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     // let maps = proc_maps::get_process_maps(child.as_raw() as proc_maps::Pid)?;
     // _print_maps_info(&maps[..]);
 
-    ptrace::cont(child, None)?;
+    ptrace::detach(child, None)?;
 
     Ok(child)
 }
@@ -555,6 +561,9 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
 pub fn wait_for_exit(child: Pid) -> Result<i32> {
     match waitpid(child, None)? {
         WaitStatus::Exited(_, code) => Ok(code),
-        _ => error("somehow got other wait status instead of exit"),
+        status => {
+            eprintln!("wait got: {:?}", status);
+            error("somehow got other wait status instead of exit")
+        }
     }
 }

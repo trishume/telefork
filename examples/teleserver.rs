@@ -1,10 +1,13 @@
-use telefork::{telepad};
+use telefork::{telepad, wait_for_exit};
 
 use std::net::{TcpListener, TcpStream};
 
 fn handle_client(mut stream: TcpStream) {
     let child = telepad(&mut stream).unwrap();
     println!("received child to pid = {}", child);
+    let status = wait_for_exit(child).unwrap();
+    println!("child exited with status = {}", status);
+
 }
 
 fn main() -> std::io::Result<()> {
