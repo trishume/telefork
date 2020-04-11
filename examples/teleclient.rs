@@ -1,31 +1,24 @@
 use telefork::{telefork, TeleforkLocation};
 
 use std::net::{TcpStream};
-use std::time::{SystemTime};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let destination = args.get(1).expect("expected arg: address of teleserver");
 
-    println!("Hello!");
+    println!("Hello, I'm a process that's about to telefork myself onto a server!");
     let foo = 103;
-    let now = SystemTime::now();
+    println!("I have a local variable that says foo={}", foo);
     let loc = {
         let mut stream = TcpStream::connect(destination).unwrap();
         telefork(&mut stream).unwrap()
     };
     match loc {
         TeleforkLocation::Child => {
-            println!("I'm a process that teleported itself to a different computer where foo={}", foo);
-            match now.elapsed() {
-               Ok(elapsed) => {
-                   println!("elapsed {:?}", elapsed);
-               }
-               Err(e) => {
-                   println!("Error: {:?}", e);
-               }
-           }
+            println!("I'm a process that teleported itself to a different computer");
+            println!("My local variable says foo={} and I'm going to exit with that status", foo);
+            std::process::exit(foo);
         }
-        TeleforkLocation::Parent => println!("finished teleforking"),
+        TeleforkLocation::Parent => println!("I succesfully teleforked myself!"),
     };
 }

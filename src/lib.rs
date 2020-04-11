@@ -215,7 +215,7 @@ fn fork_frozen_traced() -> Result<NormalForkLocation> {
             _ => error("couldn't trace child"),
         },
         ForkResult::Child => {
-            println!("hello from forked child!");
+            // println!("hello from forked child!");
             kill_me_if_parent_dies()?;
             ptrace::traceme()?;
             raise(Signal::SIGSTOP)?;
@@ -246,7 +246,7 @@ fn _print_maps_info(maps: &[proc_maps::MapRange]) {
 }
 
 pub fn telefork(out: &mut dyn Write) -> Result<TeleforkLocation> {
-    println!("teleforking");
+    // println!("teleforking");
     let proc_state = ProcessState {
         // sbrk(0) returns current brk address and it won't change for child since we don't malloc before forking
         brk_addr: unsafe { libc::sbrk(0) as usize },
@@ -466,7 +466,7 @@ fn restore_brk(child: Pid, syscall: SyscallLoc, brk_addr: usize) -> Result<()> {
 }
 
 pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
-    println!("incoming on telepad");
+    // println!("incoming on telepad");
     let child: Pid = match fork_frozen_traced()? {
         NormalForkLocation::Woke => panic!("should've woken up with my brain replaced but didn't!"),
         NormalForkLocation::Parent(p) => p,
@@ -546,6 +546,14 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
     // TODO restore TLS: This seems to involve using the arch_prcntl syscall to save and restore the FS and GS registers
     // ptrace does save/restore fs and gs though and TLS variables appear to work to me so maybe that isn't necessary?
     // There's also something about how glibc caches the pid and tid which are wrong in the new process.
+
+    // TODO support using the vDSO of a different Linux kernel. Currently it
+    // just assumes the vDSO is the same and the program crashes if it tries
+    // to use the vDSO and it isn't the same. One idea for how to fix this is
+    // to do like rr (https://github.com/mozilla/rr/issues/1216) and put jump
+    // patches at all the entry points from the orginal processes's vDSO that
+    // jump to the correct places in the new vDSO as determined by reading the
+    // vDSO ELF header.
 
     // TODO restore or forward some types of file descriptors? Maybe basic files that also exist on the new system?
 
