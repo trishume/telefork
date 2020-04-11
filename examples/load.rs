@@ -7,7 +7,7 @@ fn main() {
     let fname = &args[1];
     println!("loading from {:?}", fname);
     let mut input = File::open(fname).unwrap();
-    let child = telepad(&mut input).unwrap();
+    let child = telepad(&mut input, 1).unwrap();
     println!("child pid = {}", child);
     let status = wait_for_exit(child).unwrap();
     println!("child exited with status = {}", status);

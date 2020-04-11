@@ -8,7 +8,7 @@ use libc::{PROT_EXEC, PROT_READ, PROT_WRITE};
 use nix;
 use nix::errno::Errno;
 use nix::sys::ptrace;
-use nix::sys::signal::{kill, raise, Signal};
+use nix::sys::signal::{kill, Signal};
 use nix::sys::uio;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
@@ -200,7 +200,7 @@ fn write_state(out: &mut dyn Write, child: Pid, proc_state: ProcessState) -> Res
 
 enum NormalForkLocation {
     Parent(Pid),
-    Woke,
+    Woke(i32),
 }
 
 fn kill_me_if_parent_dies() -> nix::Result<()> {
@@ -218,8 +218,9 @@ fn fork_frozen_traced() -> Result<NormalForkLocation> {
             // println!("hello from forked child!");
             kill_me_if_parent_dies()?;
             ptrace::traceme()?;
-            raise(Signal::SIGSTOP)?;
-            Ok(NormalForkLocation::Woke)
+            // TODO is there a better way to pass a number along? This fails to detect if the raise syscall failed
+            let raise_result = unsafe { libc::raise(libc::SIGSTOP) };
+            Ok(NormalForkLocation::Woke(raise_result))
         }
     }
 }
@@ -227,7 +228,7 @@ fn fork_frozen_traced() -> Result<NormalForkLocation> {
 #[derive(Debug)]
 pub enum TeleforkLocation {
     Parent,
-    Child,
+    Child(i32),
 }
 
 fn _print_maps_info(maps: &[proc_maps::MapRange]) {
@@ -253,7 +254,7 @@ pub fn telefork(out: &mut dyn Write) -> Result<TeleforkLocation> {
     };
     // println!("brk addr: {:>16x}", proc_state.brk_addr);
     let child: Pid = match fork_frozen_traced()? {
-        NormalForkLocation::Woke => return Ok(TeleforkLocation::Child),
+        NormalForkLocation::Woke(v) => return Ok(TeleforkLocation::Child(v)),
         NormalForkLocation::Parent(p) => p,
     };
     write_state(out, child, proc_state)?;
@@ -465,10 +466,10 @@ fn restore_brk(child: Pid, syscall: SyscallLoc, brk_addr: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
+pub fn telepad(inp: &mut dyn Read, pass_to_child: i32) -> Result<Pid> {
     // println!("incoming on telepad");
     let child: Pid = match fork_frozen_traced()? {
-        NormalForkLocation::Woke => panic!("should've woken up with my brain replaced but didn't!"),
+        NormalForkLocation::Woke(_) => panic!("should've woken up with my brain replaced but didn't!"),
         NormalForkLocation::Parent(p) => p,
     };
 
@@ -536,7 +537,10 @@ pub fn telepad(inp: &mut dyn Read) -> Result<Pid> {
                 inp.read_exact(&mut reg_bytes[..])?;
                 // FIXME remove unwrap
                 let reg_info = RegInfo::from_bytes(&reg_bytes[..]).unwrap();
-                ptrace::setregs(child, reg_info.regs)?;
+                let mut regs = reg_info.regs;
+                // We'll be resuming from the "raise" syscall which checks for an i32 result in rax and libc passes along
+                regs.rax = pass_to_child as u64;
+                ptrace::setregs(child, regs)?;
                 break;
             }
         }
@@ -574,4 +578,43 @@ pub fn wait_for_exit(child: Pid) -> Result<i32> {
             error("somehow got other wait status instead of exit")
         }
     }
+}
+
+use std::net::{TcpStream, ToSocketAddrs};
+use std::os::unix::io::FromRawFd;
+
+// teleforks to a teleserver compatible server, executes `f`, then receives a
+// telefork back. Only returns in the new process that is teleforked back on
+// the client, the original process waits for its child to exit then exits
+// with the same status.
+pub fn yoyo<A: ToSocketAddrs, F: FnOnce() -> ()>(dest: A, f: F) {
+    let mut stream = TcpStream::connect(dest).unwrap();
+    let loc = telefork(&mut stream).unwrap();
+    match loc {
+        TeleforkLocation::Child(fd) => {
+            let mut stream = unsafe { TcpStream::from_raw_fd(fd) };
+
+            // Do some work on the remote server
+            f();
+
+            let loc = telefork(&mut stream).unwrap();
+            std::mem::forget(stream); // parent drops stream not us
+            match loc {
+                // return normally in the child we teleforked back
+                TeleforkLocation::Child(_) => return,
+                // exit succesfully in the now unnecessary server process
+                TeleforkLocation::Parent => std::process::exit(0),
+            };
+        }
+        // teleforked succesfully, return out of match statement and wait to receive telefork back
+        TeleforkLocation::Parent => (),
+    };
+
+    // receive the telefork back
+    let child = telepad(&mut stream, 0).unwrap();
+    // we don't return from this function in the original process, we let it
+    // return in the newly received process then just wait and exit with the
+    // same status
+    let status = wait_for_exit(child).unwrap();
+    std::process::exit(status);
 }

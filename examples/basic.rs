@@ -24,10 +24,11 @@ fn main() {
         telefork(&mut output).unwrap()
     };
     match loc {
-        TeleforkLocation::Child => {
+        TeleforkLocation::Child(val) => {
             // raise(Signal::SIGSTOP).unwrap();
             // std::process::exit(foo);
-            println!("hello from a strange new world where foo={}", foo);
+            println!("hello from a strange new world where I woke up passed {}", val);
+            println!("My local variable says foo={} and I'm going to exit with that status", foo);
 
             // I'm somewhat confused about why TLS seems to me to just work.
             // ptrace register setting seems to include the fs and gs
@@ -43,7 +44,7 @@ fn main() {
         TeleforkLocation::Parent => println!("finished teleforking"),
     };
     let mut input = File::open(fname).unwrap();
-    let child = telepad(&mut input).unwrap();
+    let child = telepad(&mut input, 7).unwrap();
     println!("child pid = {}", child);
     let status = wait_for_exit(child).unwrap();
     println!("child exited with status = {}", status);

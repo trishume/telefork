@@ -10,3 +10,6 @@ nix = "0.17.0"
 libc = "0.2.67"
 bincode = "1.2.1"
 serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+num_cpus = "1.12"
