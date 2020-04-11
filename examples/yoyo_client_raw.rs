@@ -1,6 +1,6 @@
 use telefork::{telefork, telepad, wait_for_exit, TeleforkLocation};
 
-use std::net::{TcpStream};
+use std::net::TcpStream;
 use std::os::unix::io::FromRawFd;
 
 fn main() {
@@ -16,7 +16,10 @@ fn main() {
         TeleforkLocation::Child(fd) => {
             let mut stream = unsafe { TcpStream::from_raw_fd(fd) };
             println!("I'm a process that teleported itself to a different computer");
-            println!("My local variable says foo={} and I'm going to exit with that status", foo);
+            println!(
+                "My local variable says foo={} and I'm going to exit with that status",
+                foo
+            );
 
             // Do some work on the remote server
             foo = 42;

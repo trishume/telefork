@@ -1,7 +1,7 @@
 use smallpt::*;
-use std::path::Path;
 use std::fs::File;
 use std::io::BufWriter;
+use std::path::Path;
 use std::time::Instant;
 
 fn create_scene() -> Scene {
@@ -12,14 +12,22 @@ fn create_scene() -> Scene {
     scene.add(Box::new(Sphere::new(
         16.5,
         Vec3::new(27.0, 16.5, 47.0),
-        Material::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0), BSDF::Mirror),
+        Material::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            BSDF::Mirror,
+        ),
     )));
 
     // Glass
     scene.add(Box::new(Sphere::new(
         16.5,
         Vec3::new(73.0, 16.5, 78.0),
-        Material::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0), BSDF::Glass),
+        Material::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            BSDF::Glass,
+        ),
     )));
 
     // Planes
@@ -27,42 +35,66 @@ fn create_scene() -> Scene {
     scene.add(Box::new(Plane::new(
         Vec3::new(0.0, 0.0, 0.0),
         Vec3::new(0.0, 1.0, 0.0),
-        Material::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.75, 0.75, 0.75), BSDF::Diffuse),
+        Material::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.75, 0.75, 0.75),
+            BSDF::Diffuse,
+        ),
     )));
 
     // Left
     scene.add(Box::new(Plane::new(
         Vec3::new(1.0, 0.0, 0.0),
         Vec3::new(1.0, 0.0, 0.0),
-        Material::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.75, 0.25, 0.25), BSDF::Diffuse),
+        Material::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.75, 0.25, 0.25),
+            BSDF::Diffuse,
+        ),
     )));
 
     // Right
     scene.add(Box::new(Plane::new(
         Vec3::new(99.0, 0.0, 0.0),
         Vec3::new(-1.0, 0.0, 0.0),
-        Material::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.25, 0.25, 0.75), BSDF::Diffuse),
+        Material::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.25, 0.25, 0.75),
+            BSDF::Diffuse,
+        ),
     )));
 
     // Front
     scene.add(Box::new(Plane::new(
         Vec3::new(0.0, 0.0, 0.0),
         Vec3::new(0.0, 0.0, 1.0),
-        Material::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.75, 0.75, 0.75), BSDF::Diffuse),
+        Material::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.75, 0.75, 0.75),
+            BSDF::Diffuse,
+        ),
     )));
 
     // Back
     scene.add(Box::new(Plane::new(
         Vec3::new(0.0, 0.0, 170.0),
         Vec3::new(0.0, 0.0, -1.0),
-        Material::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0), BSDF::Diffuse),
+        Material::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            BSDF::Diffuse,
+        ),
     )));
 
     // Top
     scene.add(Box::new(Plane::new(
         Vec3::new(0.0, 81.6, 0.0),
         Vec3::new(0.0, -1.0, 0.0),
-        Material::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.75, 0.75, 0.75), BSDF::Diffuse),
+        Material::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.75, 0.75, 0.75),
+            BSDF::Diffuse,
+        ),
     )));
 
     // Light (emissive rectangle)
@@ -73,14 +105,18 @@ fn create_scene() -> Scene {
         Vec3::new(0.0, 0.0, 1.0),
         33.0,
         33.0,
-        Material::new(Vec3::new(12.0, 12.0, 12.0), Vec3::new(0.0, 0.0, 0.0), BSDF::Diffuse),
+        Material::new(
+            Vec3::new(12.0, 12.0, 12.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            BSDF::Diffuse,
+        ),
     )));
 
     scene
 }
 
 fn render_scene(scene: &Scene, width: usize, height: usize, backbuffer: &mut [Vec3]) {
-    let num_samples = 512;
+    let num_samples = 2048;
     let mut num_rays = 0;
     let camera = Camera {
         origin: Vec3::new(50.0, 50.0, 200.0),
@@ -90,8 +126,23 @@ fn render_scene(scene: &Scene, width: usize, height: usize, backbuffer: &mut [Ve
     };
 
     println!("starting trace on {} cores", num_cpus::get());
-    trace(&scene, &camera, width, height, num_samples, backbuffer, &mut num_rays);
-    println!("finished tracing!");
+    // In a really unfortunate turn of events, glibc uses the vDSO to get the
+    // time when getting the number of cores using get_nprocs, which
+    // apparently rayon calls during setup. See
+    // https://github.com/bminor/glibc/blob/5f72f9800b250410cad3abfeeb09469ef12b2438/sysdeps/unix/sysv/linux/getsysstats.c#L131
+    // So this only works when either on the same kernel version or when using
+    // JANKY_VDSO_TELEPORT mode. So we might as well time it while we're at it
+    let now = Instant::now();
+    trace(
+        &scene,
+        &camera,
+        width,
+        height,
+        num_samples,
+        backbuffer,
+        &mut num_rays,
+    );
+    println!("finished tracing in {:?}!", now.elapsed());
 }
 
 fn save_png_file(width: usize, height: usize, backbuffer: &[Vec3]) {
@@ -99,9 +150,9 @@ fn save_png_file(width: usize, height: usize, backbuffer: &[Vec3]) {
     for i in 0..width * height {
         let color = saturate(tonemap(backbuffer[i]));
 
-        data[i*3+0] = (color.x * 255.0).round() as u8; // r
-        data[i*3+1] = (color.y * 255.0).round() as u8; // g
-        data[i*3+2] = (color.z * 255.0).round() as u8; // b
+        data[i * 3 + 0] = (color.x * 255.0).round() as u8; // r
+        data[i * 3 + 1] = (color.y * 255.0).round() as u8; // g
+        data[i * 3 + 2] = (color.z * 255.0).round() as u8; // b
     }
 
     let path = Path::new("render.png");

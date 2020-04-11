@@ -21,6 +21,15 @@ use serde::{Deserialize, Serialize};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const PAGE_SIZE: usize = 4096;
 
+// In order to do the path tracing demo to a remote server with a different
+// kernel I really just wanted to get it to work even though it used the vDSO.
+// I did this by just overriding it to teleport the vDSO contents anyways
+// instead of remapping. The issue is I have no idea how the vDSO actually
+// interacts with the kernel so this might totally not work. Also I don't
+// properly handle the case where mappings collide and the existing and new
+// map vDSO might overlap. This setting enables this janky vDSO support.
+const JANKY_VDSO_TELEPORT: bool = false;
+
 #[derive(Serialize, Deserialize, Debug)]
 struct Mapping {
     name: Option<String>,
@@ -69,6 +78,16 @@ enum Command {
 fn is_special_kernel_map(map: &proc_maps::MapRange) -> bool {
     match map.filename() {
         Some(n) if (n == "[vdso]" || n == "[vsyscall]" || n == "[vvar]") => true,
+        _ => false,
+    }
+}
+
+fn should_teleport_kernel_map_anyways(map: &proc_maps::MapRange) -> bool {
+    if !JANKY_VDSO_TELEPORT {
+        return false;
+    }
+    match map.filename() {
+        Some(n) if n == "[vdso]" => true,
         _ => false,
     }
 }
@@ -173,7 +192,9 @@ fn write_state(out: &mut dyn Write, child: Pid, proc_state: ProcessState) -> Res
     let (special_maps, regular_maps) = maps
         .into_iter()
         .filter(|m| !should_skip_map(&m))
-        .partition::<Vec<proc_maps::MapRange>, _>(|m| is_special_kernel_map(&m));
+        .partition::<Vec<proc_maps::MapRange>, _>(|m| {
+            is_special_kernel_map(&m) && !should_teleport_kernel_map_anyways(&m)
+        });
 
     for map in &special_maps {
         write_special_kernel_map(out, map)?;
@@ -469,7 +490,9 @@ fn restore_brk(child: Pid, syscall: SyscallLoc, brk_addr: usize) -> Result<()> {
 pub fn telepad(inp: &mut dyn Read, pass_to_child: i32) -> Result<Pid> {
     // println!("incoming on telepad");
     let child: Pid = match fork_frozen_traced()? {
-        NormalForkLocation::Woke(_) => panic!("should've woken up with my brain replaced but didn't!"),
+        NormalForkLocation::Woke(_) => {
+            panic!("should've woken up with my brain replaced but didn't!")
+        }
         NormalForkLocation::Parent(p) => p,
     };
 
@@ -500,7 +523,14 @@ pub fn telepad(inp: &mut dyn Read, pass_to_child: i32) -> Result<Pid> {
                 restore_brk(child, vdso_syscall, brk_addr)?;
             }
             Command::Remap { name, addr, size } => {
-                let matching_map = find_map_named(&maps, &name).unwrap();
+                let matching_map = find_map_named(&maps, &name);
+                let matching_map = match matching_map {
+                    Some(m) => m,
+                    None => {
+                        eprintln!("no matching map for {} so can't remap", name);
+                        continue;
+                    }
+                };
 
                 // TODO on my NixOS box the VDSO is a different size than my Docker container
                 // this may just be a case that's nigh-impossible to handle fully correctly or I'm missing a trick

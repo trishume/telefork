@@ -12,7 +12,10 @@ fn main() {
     };
     match loc {
         TeleforkLocation::Child(val) => {
-            println!("hello after first telefork where val={} and foo={}", val, foo);
+            println!(
+                "hello after first telefork where val={} and foo={}",
+                val, foo
+            );
             foo = 42;
             let loc = {
                 let mut output = File::create("dump2.telefork.bin").unwrap();
@@ -20,7 +23,10 @@ fn main() {
             };
             match loc {
                 TeleforkLocation::Child(val) => {
-                    println!("hello after second telefork where val={} and foo={}", val, foo);
+                    println!(
+                        "hello after second telefork where val={} and foo={}",
+                        val, foo
+                    );
                 }
                 TeleforkLocation::Parent => println!("finished second telefork to file"),
             };

@@ -1,6 +1,6 @@
 use telefork::{telefork, TeleforkLocation};
 
-use std::net::{TcpStream};
+use std::net::TcpStream;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -15,8 +15,14 @@ fn main() {
     };
     match loc {
         TeleforkLocation::Child(val) => {
-            println!("I'm a process that teleported itself to a different computer and received val={}", val);
-            println!("My local variable says foo={} and I'm going to exit with that status", foo);
+            println!(
+                "I'm a process that teleported itself to a different computer and received val={}",
+                val
+            );
+            println!(
+                "My local variable says foo={} and I'm going to exit with that status",
+                foo
+            );
             std::process::exit(foo);
         }
         TeleforkLocation::Parent => println!("I succesfully teleforked myself!"),

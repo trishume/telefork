@@ -4,12 +4,15 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
 
 fn handle_client(mut stream: TcpStream) {
+    println!("TELESERVER: starting to receive process!");
     let fd = stream.as_raw_fd() as i32;
     let child = telepad(&mut stream, fd).unwrap();
-    println!("TELESERVER: received child to pid = {} and passed TCP fd={}", child, fd);
+    println!(
+        "TELESERVER: received child to pid = {} and passed TCP fd={}",
+        child, fd
+    );
     let status = wait_for_exit(child).unwrap();
     println!("TELESERVER: child exited with status = {}", status);
-
 }
 
 fn main() -> std::io::Result<()> {
