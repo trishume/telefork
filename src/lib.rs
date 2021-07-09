@@ -8,7 +8,7 @@
 //! to bottom is a good way to understand how it works. This is also why it's
 //! all in one module, because I can't make a good reading order across modules.
 
-// The nix crate iis a handy Rust-ified wrapper over libc stuff
+// The nix crate is a handy Rust-ified wrapper over libc stuff
 use nix;
 use nix::errno::Errno;
 use nix::sys::ptrace;
